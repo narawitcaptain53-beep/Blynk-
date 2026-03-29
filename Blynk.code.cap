@@ -1,0 +1,113 @@
+
+#define BLYNK_TEMPLATE_ID "TMPL6vG9Jhrym"
+#define BLYNK_TEMPLATE_NAME "Sleep Apnea999"
+#define BLYNK_AUTH_TOKEN "6SDfiCvbcH3oBAsChx9MAivT_Dp8ryUf"
+
+#include <WiFi.h>
+#include <WiFiClient.h>
+#include <BlynkSimpleEsp32.h>
+#include <Wire.h>
+#include "MAX30105.h"
+#include "heartRate.h"  //ลด Noise
+
+// 2. ข้อมูล WiFi
+char ssid[] = "HONOR Pad X8a";
+char pass[] = "Alamoo88";
+
+MAX30105 particleSensor;
+BlynkTimer timer;
+WidgetTerminal terminal(V6);
+
+ //(คำนวณ BPM และทำค่าเฉลี่ย)
+const byte RATE_SIZE = 4;  // ทําการวัดซํ่า4รอบเแลี่ยก่อนข่อยส่งข้อมูล ข้อดีเสถียร ข้อเสีย ช้า(ตามทฤษฎี)นะ
+byte rates[RATE_SIZE];     // Array เก็บค่าประวัติ BPM
+byte rateSpot = 0;
+long lastBeat = 0;  // เก็บเวลาที่หัวใจเต้นครั้งล่าสุด
+float beatsPerMinute;
+int beatAvg;  // ค่า BPM เฉลี่ยที่ลด Noise แล้ว พร้อมส่งขึ้น Blynk
+
+// ฟังก์ชันนี้จะทำงานทุกๆ 3 วินาที เพื่อ "ส่งค่า" ขึ้น Blynk
+void checkHealthAI() {
+  long irValue = particleSensor.getIR();  // เช็คสถานะการใส่นิ้ว
+
+  // ตรวจสอบการสวมใส่
+  if (irValue < 50000) {
+    Blynk.virtualWrite(V0, 0);  // ไฟสถานะดับ
+    beatAvg = 0;                // รีเซ็ตค่าเมื่อเอานิ้วออก
+    terminal.println("Doctor AI: กรุณาสวมถุงมือให้กระชับครับ");
+    Blynk.virtualWrite(V1, 0);  // ส่งค่า 0 ไปที่เกจ
+  } else {
+    Blynk.virtualWrite(V0, 255);  // ไฟสถานะติด
+
+    // ส่งค่าชีพจรของจริง (ที่ประมวลผลจากใน loop) ไปแสดงผลบนแอป
+    Blynk.virtualWrite(V1, beatAvg);
+
+    // สมมติ SpO2 ไว้ก่อน (การคำนวณ SpO2 ของจริงซับซ้อนกว่า BPM มาก มักต้องเขียนเพิ่มอีกไฟล์)
+    int testSpO2 = random(95, 100);
+    Blynk.virtualWrite(V2, testSpO2);
+
+    // AI ประเมินผล 
+    if (beatAvg > 100) {
+      terminal.println("Warning: ชีพจรเต้นเร็วผิดปกติ!");
+    } else if (beatAvg > 50) {
+      terminal.println("Doctor AI: สัญญาณชีพปกติดีครับ");
+    } else {
+      terminal.println("Doctor AI: กำลังรวบรวมข้อมูลชีพจร...");  // รอให้ค่าเฉลี่ยนิ่ง
+    }
+  }
+  terminal.flush();
+}
+
+void setup() {
+  Serial.begin(115200);
+  Blynk.begin(BLYNK_AUTH_TOKEN, ssid, pass);
+
+  if (!particleSensor.begin(Wire, I2C_SPEED_FAST)) {  // เปลี่ยนเป็น FAST เพื่อให้อ่านค่าได้เร็วขึ้น
+    Serial.println("หา MAX30102 ไม่เจอ ตรวจสอบการต่อสาย!");
+    while (1)
+      ;
+  }
+
+  // ตั้งค่าเซ็นเซอร์สำหรับอ่านชีพจรโดยเฉพาะ
+  particleSensor.setup();
+  particleSensor.setPulseAmplitudeRed(0x0A);  // หรี่ไฟ LED สีแดงลง
+  particleSensor.setPulseAmplitudeGreen(0);   // ปิดไฟสีเขียว (MAX30102 ไม่มีไฟเขียว)
+
+  timer.setInterval(3000L, checkHealthAI);
+
+  terminal.clear();
+  terminal.println("ระบบสมองเริ่มทำงาน รอรับสัญญาณ...");
+  terminal.flush();
+}
+
+void loop() {
+  Blynk.run();
+  timer.run();
+
+  //   อ่านค่าจากเซ็นเซอร์ตลอดเวลาเพื่อตรวจจับจังหวะเต้นของหัวใจ
+  long irValue = particleSensor.getIR();
+
+  // checkForBeat() คือฟังก์ชันจาก heartRate.h ที่ช่วยกรอง Noise และหา Peak เจอในgithubถามaiมามันบอกว่าจะสเถียรขึ้น
+  if (checkForBeat(irValue) == true) {
+
+    // ถ้าเจอจังหวะการเต้น ให้นำเวลาปัจจุบันไปลบเวลาที่เต้นครั้งก่อน = ระยะห่างของชีพจร
+    long delta = millis() - lastBeat;
+    lastBeat = millis();
+
+    // คำนวณออกมาเป็นครั้งต่อนาที (BPM)
+    beatsPerMinute = 60 / (delta / 1000.0);
+
+    // ขัดเลือก Noise ชั้นที่ 2: เอาเฉพาะค่าที่เป็นไปได้ของมนุษย์ (20 - 255 BPM)
+    if (beatsPerMinute < 255 && beatsPerMinute > 20) {
+      rates[rateSpot++] = (byte)beatsPerMinute;  // เก็บค่าลง Array
+      rateSpot %= RATE_SIZE;
+
+      // ทำ Moving Average (หาค่าเฉลี่ย) เพื่อให้ตัวเลขนิ่ง ไม่สวิงไปมา
+      beatAvg = 0;
+      for (byte x = 0; x < RATE_SIZE; x++) {
+        beatAvg += rates[x];
+      }
+      beatAvg /= RATE_SIZE;
+    }
+  }
+}
