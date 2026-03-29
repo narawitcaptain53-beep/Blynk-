@@ -1,0 +1,162 @@
+#define BLYNK_TEMPLATE_ID "TMPL6vG9Jhrym"
+#define BLYNK_TEMPLATE_NAME "Sleep Apnea999"
+#define BLYNK_AUTH_TOKEN "6SDfiCvbcH3oBAsChx9MAivT_Dp8ryUf"
+
+#include <WiFi.h>
+#include <WiFiClient.h>
+#include <BlynkSimpleEsp32.h>
+#include <Wire.h>
+#include "MAX30105.h"
+#include "heartRate.h" 
+#include "spo2_algorithm.h" //  อิมพอร์ต "สมองซีกที่ 2" สำหรับคำนวณออกซิเจนในเลือด
+
+// ข้อมูล WiFi
+char ssid[] = "HONOR Pad X8a";
+char pass[] = "Alamoo88";
+
+MAX30105 particleSensor;
+BlynkTimer timer;
+WidgetTerminal terminal(V6);
+
+//  ตัวแปรสำหรับ BPM 
+const byte RATE_SIZE = 4;  
+byte rates[RATE_SIZE];     
+byte rateSpot = 0;
+long lastBeat = 0;  
+float beatsPerMinute;
+int beatAvg = 0;  
+
+//  ตัวแปรสำหรับ SpO2 (จาก GitHub)
+uint32_t irBuffer[100];  // Array เก็บค่าแสง IR (ทะลุเลือด) 100 ชุด
+uint32_t redBuffer[100]; // Array เก็บค่าแสง Red (สะท้อนเลือด) 100 ชุด
+int32_t bufferLength = 100;
+int32_t spo2;           // ตัวแปรเก็บค่า SpO2 ดิบ
+int8_t validSPO2;       // ตัวเช็คว่าค่า SpO2 เชื่อถือได้ไหม (1=ใช้ได้, 0=ใช้ไม่ได้)
+int32_t heartRate;      // (อัลกอริทึมของ Maxim จะคำนวณตัวนี้ด้วย แต่เราจะใช้ beatAvg ของคุณที่นิ่งกว่า)
+int8_t validHeartRate;
+int sp02Avg = 0;        // ค่า SpO2 เฉลี่ยที่พร้อมส่งขึ้นแอป Blynk
+
+// ฟังก์ชันนี้จะทำงานทุกๆ 3 วินาที เพื่อ "ส่งค่า" ขึ้น Blynk
+void checkHealthAI() {
+  long irValue = particleSensor.getIR();  
+
+  // ตรวจสอบการสวมใส่
+  if (irValue < 50000) {
+    Blynk.virtualWrite(V0, 0);  // ไฟสถานะดับ
+    beatAvg = 0;                // รีเซ็ตค่าเมื่อเอานิ้วออก
+    sp02Avg = 0;                // รีเซ็ตค่า SpO2
+    terminal.println("Doctor AI: กรุณาสวมถุงมือให้กระชับครับ");
+    Blynk.virtualWrite(V1, 0);  
+    Blynk.virtualWrite(V2, 0);  
+  } else {
+    Blynk.virtualWrite(V0, 255);  // ไฟสถานะติด
+
+    // ส่งค่าชีพจรและออกซิเจนของจริง ไปแสดงผลบนแอป
+    Blynk.virtualWrite(V1, beatAvg);
+    Blynk.virtualWrite(V2, sp02Avg); // ส่ง SpO2 จริงๆ แล้ว ไม่ใช่ random
+
+    // AI ประเมินผลแบบอัปเกรด (รวม SpO2)
+    if (beatAvg > 100) {
+      terminal.println("Warning: ชีพจรเต้นเร็วผิดปกติ!");
+    } else if (sp02Avg > 0 && sp02Avg < 93) { 
+      terminal.println("Warning: ตรวจพบออกซิเจนต่ำ! กรุณาหายใจลึกๆ");
+    } else if (beatAvg > 50 && sp02Avg >= 93) {
+      terminal.println("Doctor AI: สัญญาณชีพและระดับออกซิเจนปกติดีครับ");
+    } else {
+      terminal.println("Doctor AI: กำลังคำนวณผลเลือด...");  // รอให้ค่าเฉลี่ยนิ่ง
+    }
+  }
+  terminal.flush();
+}
+
+void setup() {
+  Serial.begin(115200);
+  Blynk.begin(BLYNK_AUTH_TOKEN, ssid, pass);
+
+  if (!particleSensor.begin(Wire, I2C_SPEED_FAST)) {  
+    Serial.println("หา MAX30102 ไม่เจอ ตรวจสอบการต่อสาย!");
+    while (1);
+  }
+
+  //  ตั้งค่าเซ็นเซอร์ตามสเปกของ GitHub เพื่อให้ตรวจจับ SpO2 ได้ลึกและแม่นขึ้น
+  byte ledBrightness = 60; // ความสว่าง LED
+  byte sampleAverage = 4;  // กรองสัญญาณรบกวน 4 ชั้น
+  byte ledMode = 2;        // 2 = เปิดทั้ง Red และ IR
+  byte sampleRate = 100;   // เก็บ 100 ตัวอย่างต่อวินาที
+  int pulseWidth = 411;    
+  int adcRange = 4096;     
+  
+  particleSensor.setup(ledBrightness, sampleAverage, ledMode, sampleRate, pulseWidth, adcRange);
+
+  terminal.clear();
+  terminal.println("ระบบสมองเริ่มทำงาน...");
+  terminal.println("กำลัง Calibrate เซ็นเซอร์ (กรุณารอ 2-3 วินาที)...");
+  terminal.flush();
+
+  //  เก็บตัวอย่างเลือด 100 ชุดแรกลงใน Array ก่อนเริ่มทำงาน (เพื่อหา SpO2 ค่าแรก)
+  for (byte i = 0 ; i < bufferLength ; i++) {
+    while (particleSensor.available() == false) 
+      particleSensor.check(); // รอข้อมูลมา
+    
+    redBuffer[i] = particleSensor.getRed();
+    irBuffer[i] = particleSensor.getIR();
+    particleSensor.nextSample(); 
+  }
+
+  // คำนวณเลือดครั้งที่ 1
+  maxim_heart_rate_and_oxygen_saturation(irBuffer, bufferLength, redBuffer, &spo2, &validSPO2, &heartRate, &validHeartRate);
+
+  timer.setInterval(3000L, checkHealthAI);
+}
+
+void loop() {
+  Blynk.run();
+  timer.run();
+
+  //  เลื่อนข้อมูลเก่า 25 ชุดทิ้ง เพื่อเอาที่ว่างไปรับข้อมูลใหม่ 25 ชุด (Shift Data)
+  for (byte i = 25; i < 100; i++) {
+    redBuffer[i - 25] = redBuffer[i];
+    irBuffer[i - 25] = irBuffer[i];
+  }
+
+  // เก็บข้อมูลใหม่เพิ่มเข้าไปอีก 25 ชุดให้เต็ม 100
+  for (byte i = 75; i < 100; i++) {
+    while (particleSensor.available() == false) 
+      particleSensor.check(); 
+
+    redBuffer[i] = particleSensor.getRed();
+    irBuffer[i] = particleSensor.getIR();
+    particleSensor.nextSample();
+
+    //  ในระหว่างที่รับข้อมูล 25 ชุดนี้ ก็ให้เช็คจังหวะชีพจร (BPM) ไปด้วยเลย
+    long irValue = irBuffer[i];
+    if (checkForBeat(irValue) == true) {
+      long delta = millis() - lastBeat;
+      lastBeat = millis();
+      beatsPerMinute = 60 / (delta / 1000.0);
+
+      if (beatsPerMinute < 255 && beatsPerMinute > 20) {
+        rates[rateSpot++] = (byte)beatsPerMinute;  
+        rateSpot %= RATE_SIZE;
+
+        beatAvg = 0;
+        for (byte x = 0; x < RATE_SIZE; x++) {
+          beatAvg += rates[x];
+        }
+        beatAvg /= RATE_SIZE;
+      }
+    }
+  }
+
+  //  เมื่อเก็บข้อมูลใหม่ครบ 25 ชุด (รวมของเก่าเป็น 100 ชุด) ให้คำนวณ SpO2 รอบใหม่
+  maxim_heart_rate_and_oxygen_saturation(irBuffer, bufferLength, redBuffer, &spo2, &validSPO2, &heartRate, &validHeartRate);
+
+  //  ตรวจสอบว่าค่า SpO2 ที่คำนวณได้ "สมเหตุสมผล" ไหม ถ้าใช่ ให้นำมาหาค่าเฉลี่ย
+  if (validSPO2 == 1 && spo2 < 100 && spo2 > 50) {
+    if (sp02Avg == 0) {
+      sp02Avg = spo2; // ใช้ค่านี้เป็นค่าเริ่มต้นเมื่อเริ่มสวมใส่
+    } else {
+      sp02Avg = (sp02Avg + spo2) / 2; // หาค่าเฉลี่ยเพื่อไม่ให้ตัวเลขกระโดดไปมา
+    }
+  }
+}
