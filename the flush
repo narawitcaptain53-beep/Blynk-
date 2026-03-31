@@ -35,27 +35,39 @@ int sp02Avg = 0;
 
 void checkHealthAI() {
   long irValue = particleSensor.getIR();  
+
   if (irValue < 50000) {
-    Blynk.virtualWrite(V0, 0);  
-    beatAvg = 0;                
-    sp02Avg = 0;                
-    bufferIndex = 0; // เอานิ้วออก ให้ล้างค่าที่สะสมมาทิ้งไป
+    // ถ้านิ้วหลุด หรือยังไม่ได้สวมถุงมือ
+    isCalibrated = false;       // ยกเลิกสถานะ Calibrate ทันที
+    Blynk.virtualWrite(V0, 0);  // ปิดไฟสถานะ
+    beatAvg = 0;                // ล้างค่า
+    sp02Avg = 0;                // ล้างค่า
+    bufferIndex = 0;            // ล้างข้อมูลที่สะสมไว้ทิ้งไป
+    
     terminal.println("Doctor AI: กรุณาสวมถุงมือให้กระชับครับ");
     Blynk.virtualWrite(V1, 0);  
     Blynk.virtualWrite(V2, 0);  
+    
+  } else if (isCalibrated == false) {
+    // สวมนิ้วแล้ว แต่เซ็นเซอร์กำลังรวบรวมข้อมูลให้ครบ 100 ชุดอยู่ (ประมาณ 1-2 วินาทีแรก)
+    Blynk.virtualWrite(V0, 255); // เปิดไฟสถานะ
+    terminal.println("Doctor AI: กำลัง Calibrate เซ็นเซอร์... กรุณานิ่งๆ ครับ");
+    
   } else {
+    // Calibrate เสร็จแล้ว และได้ข้อมูลพร้อมวิเคราะห์
     Blynk.virtualWrite(V0, 255);  
     Blynk.virtualWrite(V1, beatAvg);
     Blynk.virtualWrite(V2, sp02Avg); 
 
+    // วิเคราะห์ผลตามหลักการแพทย์
     if (beatAvg > 100) {
       terminal.println("Warning: ชีพจรเต้นเร็วผิดปกติ!");
-    } else if (sp02Avg > 0 && sp02Avg < 93) { 
+    } else if (beatAvg < 60 && beatAvg > 0) {
+      terminal.println("Warning: ชีพจรเต้นช้าต่ำกว่าปกติ!");
+    } else if (sp02Avg > 0 && sp02Avg < 95) { 
       terminal.println("Warning: ตรวจพบออกซิเจนต่ำ!");
-    } else if (beatAvg > 50 && sp02Avg >= 93) {
-      terminal.println("Doctor AI: สัญญาณชีพปกติดีครับ");
     } else {
-      terminal.println("Doctor AI: กำลังอ่านค่าเลือด...");  
+      terminal.println("Doctor AI: สัญญาณชีพและออกซิเจนปกติดีครับ (60-100 BPM)");
     }
   }
   terminal.flush();
@@ -81,6 +93,8 @@ void setup() {
 }
 
 void loop() {
+  bool isCalibrated = false;
+  int sp02Avg = 0;
   Blynk.run(); // เลี้ยงแอป Blynk ตลอดเวลา (หัวใจสำคัญไม่ให้แอปค้าง)** ถึงไม่กดบูทก็ยังทํางานต่อไป
   timer.run();
 
@@ -110,10 +124,10 @@ void loop() {
     if (bufferIndex >= 100) {
       maxim_heart_rate_and_oxygen_saturation(irBuffer, 100, redBuffer, &spo2, &validSPO2, &heartRate, &validHeartRate);
       
-      if (validSPO2 == 1 && spo2 <= 100 && spo2 > 50) {
+      if (validSPO2 == 1 && spo2 <= 100 && spo2 > 60) {
         sp02Avg = spo2; // อัปเดตค่า SpO2 ล่าสุด
       }
-      
+      isCalibrated = true;
       // ล้างกระเป๋า กลับไปเริ่มเก็บใส่ช่องที่ 0 ใหม่
       bufferIndex = 0; 
     }
