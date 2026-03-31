@@ -82,7 +82,7 @@ void setup() {
   byte ledBrightness = 60; // ความสว่าง LED
   byte sampleAverage = 4;  // กรองสัญญาณรบกวน 4 ชั้น
   byte ledMode = 2;        // 2 = เปิดทั้ง Red และ IR
-  byte sampleRate = 100;   // เก็บ 100 ตัวอย่างต่อวินาที
+  byte sampleRate = 400;   // เก็บ 100 ตัวอย่างต่อวินาที
   int pulseWidth = 411;    
   int adcRange = 4096;     
   
@@ -106,7 +106,7 @@ void setup() {
   // คำนวณเลือดครั้งที่ 1
   maxim_heart_rate_and_oxygen_saturation(irBuffer, bufferLength, redBuffer, &spo2, &validSPO2, &heartRate, &validHeartRate);
 
-  timer.setInterval(3000L, checkHealthAI);
+  timer.setInterval(1000L, checkHealthAI);
 }
 
 void loop() {
@@ -123,7 +123,7 @@ void loop() {
   for (byte i = 75; i < 100; i++) {
     while (particleSensor.available() == false) 
       particleSensor.check(); 
-
+      Blynk.run();
     redBuffer[i] = particleSensor.getRed();
     irBuffer[i] = particleSensor.getIR();
     particleSensor.nextSample();
