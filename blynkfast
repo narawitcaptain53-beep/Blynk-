@@ -1,0 +1,153 @@
+#define BLYNK_TEMPLATE_ID "TMPL6vG9Jhrym"
+#define BLYNK_TEMPLATE_NAME "Sleep Apnea999"
+#define BLYNK_AUTH_TOKEN "6SDfiCvbcH3oBAsChx9MAivT_Dp8ryUf"
+
+#include <WiFi.h>
+#include <BlynkSimpleEsp32.h>
+#include <Wire.h>
+#include "MAX30105.h"
+#include "heartRate.h" 
+#include "spo2_algorithm.h" 
+
+char ssid[] = "HONOR Pad X8a";
+char pass[] = "Alamoo88";
+
+MAX30105 particleSensor;
+BlynkTimer timer;
+WidgetTerminal terminal(V6);
+
+// BPM Variables
+long lastBeat = 0;  
+float beatsPerMinute;
+int beatAvg = 0;  
+int rateSpot = 0;
+byte rates[4];
+
+// SpO2 Variables (ลดขนาดตัวแปรลงให้คำนวณไวขึ้น)
+uint32_t irBuffer[100];  
+uint32_t redBuffer[100]; 
+int bufferIndex = 0; // ตัวนับว่าตอนนี้เก็บได้กี่ค่าแล้ว
+int32_t spo2;           
+int8_t validSPO2;       
+int32_t heartRate;      
+int8_t validHeartRate;
+int sp02Avg = 0;        
+bool isCalibrated = false; 
+const byte SPO2_RATE_SIZE = 4; 
+int spo2Rates[SPO2_RATE_SIZE]; 
+byte spo2RateSpot = 0;
+
+void checkHealthAI() {
+  long irValue = particleSensor.getIR();  
+
+  if (irValue < 50000) {
+    // ถ้านิ้วหลุด หรือยังไม่ได้สวมถุงมือ
+    isCalibrated = false;       // ยกเลิกสถานะ Calibrate ทันที
+    Blynk.virtualWrite(V0, 0);  // ปิดไฟสถานะ
+    beatAvg = 0;                // ล้างค่า
+    sp02Avg = 0;                // ล้างค่า
+    bufferIndex = 0;            // ล้างข้อมูลที่สะสมไว้ทิ้งไป
+    
+    terminal.println("Doctor AI: กรุณาสวมถุงมือให้กระชับครับ");
+    Blynk.virtualWrite(V1, 0);  
+    Blynk.virtualWrite(V2, 0);  
+    
+  } else if (isCalibrated == false) {
+    // สวมนิ้วแล้ว แต่เซ็นเซอร์กำลังรวบรวมข้อมูลให้ครบ 100 ชุดอยู่ (ประมาณ 1-2 วินาทีแรก)
+    Blynk.virtualWrite(V0, 255); // เปิดไฟสถานะ
+    terminal.println("Doctor AI: กำลัง Calibrate เซ็นเซอร์... กรุณานิ่งๆ ครับ");
+    
+  } else {
+    // Calibrate เสร็จแล้ว และได้ข้อมูลพร้อมวิเคราะห์
+    Blynk.virtualWrite(V0, 255);  
+    Blynk.virtualWrite(V1, beatAvg);
+    Blynk.virtualWrite(V2, sp02Avg); 
+
+    // วิเคราะห์ผลตามหลักการแพทย์
+    if (beatAvg > 100) {
+      terminal.println("Warning: ชีพจรเต้นเร็วผิดปกติ!");
+    } else if (beatAvg < 60 && beatAvg > 0) {
+      terminal.println("Warning: ชีพจรเต้นช้าต่ำกว่าปกติ!");
+    } else if (sp02Avg > 0 && sp02Avg < 95) { 
+      terminal.println("Warning: ตรวจพบออกซิเจนต่ำ!");
+    } else {
+      terminal.println("Doctor AI: สัญญาณชีพและออกซิเจนปกติดีครับ (60-100 BPM)");
+    }
+  }
+  terminal.flush();
+}
+
+void setup() {
+  Serial.begin(115200);
+  Blynk.begin(BLYNK_AUTH_TOKEN, ssid, pass);
+
+  if (!particleSensor.begin(Wire, I2C_SPEED_FAST)) {  
+    Serial.println("MAX30102 ไม่ตอบสนอง!");
+    while (1);
+  }
+
+  // ตั้งค่าเซ็นเซอร์ให้เร็วปรื๊ด (400 Samples/วินาที)
+  particleSensor.setup(60, 4, 2, 400, 411, 4096);
+
+  terminal.clear();
+  terminal.println("กำลังคำนวณ...");
+  terminal.flush();
+
+  timer.setInterval(1000L, checkHealthAI); // อัปเดตแอปทุกๆ 1 วินาที
+}
+
+void loop() {
+
+  Blynk.run(); // เลี้ยงแอป Blynk ตลอดเวลา (หัวใจสำคัญไม่ให้แอปค้าง)
+  timer.run();
+
+  // ตรวจสอบว่ามีข้อมูลใหม่จากเซ็นเซอร์เข้ามาหรือยัง? (ถ้ายังไม่มี ก็ข้ามไปเลย ไม่ต้องรอ)
+  if (particleSensor.check() > 0) {
+    
+    // มีข้อมูลใหม่! แวะเก็บ (Buffer)
+    redBuffer[bufferIndex] = particleSensor.getRed();
+    irBuffer[bufferIndex] = particleSensor.getIR();
+    long currentIrValue = irBuffer[bufferIndex];
+
+    // เช็คชีพจรทันที (เช็คทีละจังหวะ)
+    if (checkForBeat(currentIrValue) == true) {
+      long delta = millis() - lastBeat;
+      lastBeat = millis();
+      beatsPerMinute = 60 / (delta / 1000.0);
+      if (beatsPerMinute < 255 && beatsPerMinute > 20) {
+        rates[rateSpot++] = (byte)beatsPerMinute;  
+        rateSpot %= 4;
+        beatAvg = (rates[0] + rates[1] + rates[2] + rates[3]) / 4;
+      }
+    }
+
+    bufferIndex++; // ขยับไปช่องถัดไป
+
+    // ถ้าเก็บข้อมูลสะสมครบ 100 ช่องเมื่อไหร่ (ใช้เวลาแค่เสี้ยววินาที) ค่อยเอาไปคำนวณ SpO2
+    if (bufferIndex >= 100) {
+      maxim_heart_rate_and_oxygen_saturation(irBuffer, 100, redBuffer, &spo2, &validSPO2, &heartRate, &validHeartRate);
+      
+      if (validSPO2 == 1 && spo2 <= 100 && spo2 > 70) { 
+    spo2Rates[spo2RateSpot++] = spo2; // เก็บค่าลง Array
+    spo2RateSpot %= SPO2_RATE_SIZE;
+
+    // ทำ Moving Average (หาค่าเฉลี่ย) สำหรับ SpO2 ของจริง
+    int tempSpO2Sum = 0;
+    for (byte x = 0 ; x < SPO2_RATE_SIZE ; x++) {
+      tempSpO2Sum += spo2Rates[x];
+    }
+    sp02Avg = tempSpO2Sum / SPO2_RATE_SIZE; // อัปเดตค่าเฉลี่ย SpO2 ที่นิ่งขึ้น
+    
+    //  หรืออาจใช้วิธี Exponential Moving Average (ให้น้ำหนักค่าเก่าเยอะกว่าค่าใหม่)
+    // sp02Avg = (sp02Avg * 8 + spo2 * 2) / 10; 
+  } else if (validSPO2 == 0) {
+      // ถ้าค่าไม่ valid อาจจะเลือกไม่ให้อัปเดตค่าเฉลี่ย หรือรีเซ็ตถ้าหลุดนาน
+  }
+      
+      isCalibrated = true; //  ข้อมูลครบ 100 ตัวแล้ว แจ้ง AI ให้เริ่มประเมินได้เลย
+      
+      // ล้างกระเป๋า กลับไปเริ่มเก็บใส่ช่องที่ 0 ใหม่
+      bufferIndex = 0; 
+    }
+  }
+}
