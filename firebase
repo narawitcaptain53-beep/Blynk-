@@ -1,0 +1,59 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <Firebase_ESP_Client.h>
+
+// 1. ใส่ข้อมูล WiFi
+#define WIFI_SSID "HONOR Pad X8a"
+#define WIFI_PASSWORD "Alamoo88"
+
+// 2. ใส่ข้อมูล Firebase
+#define API_KEY "AIzaSyB8iN6OFZH6lsFt-EHDtkUKGpJQjy1Ohq4"
+#define DATABASE_URL "https://sleepapnea-656ae-default-rtdb.firebaseio.com/" 
+
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+// ตัวแปรสำหรับจับเวลา (ใช้แทน delay เพื่อไม่ให้บอร์ดค้าง)
+unsigned long sendDataPrevMillis = 0;
+
+void setup() {
+  Serial.begin(115200);
+
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("Connecting to Wi-Fi");
+  while (WiFi.status() != WL_CONNECTED) {
+    Serial.print(".");
+    delay(300);
+  }
+  Serial.println("\nWiFi Connected!");
+
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+
+  // เริ่มต้นเชื่อมต่อ Firebase 
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+}
+
+void loop() {
+  // เช็กว่า Firebase พร้อมและเวลาผ่านไป 5 วินาทีแล้วหรือยัง
+  if (Firebase.ready() && (millis() - sendDataPrevMillis > 5000 || sendDataPrevMillis == 0)) {
+    sendDataPrevMillis = millis();
+    
+    Serial.println("กำลังส่งข้อมูล...");
+
+    if (Firebase.RTDB.setInt(&fbdo, "/test/number", 555)) {
+      Serial.println(">>> ส่งตัวเลข 555 สำเร็จ! <<<");
+    } else {
+      Serial.println("ล้มเหลว: " + fbdo.errorReason());
+    }
+
+    if (Firebase.RTDB.setString(&fbdo, "/test/status", "Online")) {
+      Serial.println(">>> ส่งสถานะ Online สำเร็จ! <<<");
+    } else {
+      Serial.println("ล้มเหลว: " + fbdo.errorReason());
+    }
+  }
+}
+//ลองเเก้ให้เสถียรดูเเล้วเเต่ดูเเล้วเเก้อะไรไม่ได้มากอะน่ะ
