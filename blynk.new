@@ -1,4 +1,24 @@
+#define BLYNK_TEMPLATE_ID "TMPL6vG9Jhrym"
+#define BLYNK_TEMPLATE_NAME "Sleep Apnea999"
+#define BLYNK_AUTH_TOKEN "6SDfiCvbcH3oBAsChx9MAivT_Dp8ryUf"
 
+#include <WiFi.h>
+#include <BlynkSimpleEsp32.h>
+#include <Wire.h>
+#include "MAX30105.h"
+#include "heartRate.h" 
+#include "spo2_algorithm.h" 
+
+char ssid[] = "HONOR Pad X8a";
+char pass[] = "Alamoo88";
+
+MAX30105 particleSensor;
+BlynkTimer timer;
+WidgetTerminal terminal(V6);
+
+// BPM Variables
+long lastBeat = 0;  
+float beatsPerMinute;
 int beatAvg = 0;  
 int rateSpot = 0;
 byte rates[4];
