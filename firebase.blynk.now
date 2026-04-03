@@ -1,0 +1,166 @@
+// ==========================================
+// 1. ใส่ข้อมูล Blynk (ต้องอยู่บรรทัดบนสุดเสมอ)
+// ==========================================
+#define BLYNK_TEMPLATE_ID "TMPLxxxxxx"
+#define BLYNK_TEMPLATE_NAME "Sleep Apnea"
+#define BLYNK_AUTH_TOKEN "ใส่_Blynk_Token_ที่นี่"
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <Firebase_ESP_Client.h>
+#include <BlynkSimpleEsp32.h> // ไลบรารี Blynk
+#include <Wire.h>
+#include "MAX30105.h"
+#include "heartRate.h"
+
+// ==========================================
+// 2. ข้อมูล WiFi และ Firebase
+// ==========================================
+#define WIFI_SSID "HONOR Pad X8a"
+#define WIFI_PASSWORD "Alamoo88"
+#define API_KEY "AIzaSyCM9AQqbKxfoRh0mNAfOqFnj2zex-fxIGI"
+#define DATABASE_URL "sleep-e3056-default-rtdb.asia-southeast1.firebasedatabase.app" 
+
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+bool signupOK = false;
+
+// ==========================================
+// 3. ตัวแปรสำหรับเซ็นเซอร์และระบบจัดการเวลา
+// ==========================================
+MAX30105 particleSensor;
+unsigned long sendDataPrevMillis = 0;
+unsigned long blynkPrevMillis = 0;
+
+int beatAvg = 0;
+int sp02Avg = 0; // ตัวแปรสำหรับ SpO2
+bool fingerInserted = false;
+unsigned long fingerStartTime = 0;
+
+// ตัวแปรป้องกันการส่งข้อความซ้ำเข้า Blynk (Anti-Spam)
+int currentAiState = -1; 
+int lastAiState = -1;
+
+void setup() {
+  Serial.begin(115200);
+  delay(2000);
+
+  // --- เชื่อมต่อ WiFi ---
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("Connecting to Wi-Fi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\n[SUCCESS] WiFi Connected!");
+
+  // --- ตั้งค่า Firebase ---
+  configTime(7 * 3600, 0, "pool.ntp.org", "time.nist.gov"); 
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+  if (Firebase.signUp(&config, &auth, "", "")) {
+    signupOK = true;
+  }
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+
+  // --- ตั้งค่า Blynk (ใช้ config แทน begin เพื่อไม่ให้บล็อกการทำงาน) ---
+  Blynk.config(BLYNK_AUTH_TOKEN);
+
+  // --- ตั้งค่า MAX30102 ---
+  if (!particleSensor.begin(Wire, I2C_SPEED_FAST)) {
+    // ส่งข้อมูลเข้า Serial Monitor ตามเงื่อนไข
+    Serial.println("MAX30102 ไม่ตอบสนอง!");
+    while (1); 
+  }
+  particleSensor.setup(); 
+  particleSensor.setPulseAmplitudeRed(0x0A); 
+  particleSensor.setPulseAmplitudeGreen(0); 
+
+  // ส่งข้อความเมื่อเพิ่งเปิดเครื่อง
+  Blynk.virtualWrite(V6, "กำลังคำนวณ...\n");
+}
+
+void loop() {
+  Blynk.run(); // ให้ระบบ Blynk ทำงาน
+
+  // ---------------------------------------------------------
+  // ส่วนที่ 1: อ่านค่าเซ็นเซอร์และประมวลผลอาการ
+  // ---------------------------------------------------------
+  long irValue = particleSensor.getIR();
+
+  if (irValue < 50000) {
+    // กรณี: ไม่ได้ใส่นิ้ว หรือ นิ้วหลุด
+    fingerInserted = false;
+    beatAvg = 0;
+    sp02Avg = 0;
+    currentAiState = 0; 
+  } else {
+    // กรณี: ใส่นิ้วอยู่
+    if (!fingerInserted) {
+      fingerInserted = true;
+      fingerStartTime = millis(); // เริ่มจับเวลาตอนสอดนิ้ว
+    }
+
+    // (สมมติว่าคุณมีฟังก์ชันคำนวณ BPM และ SpO2 อยู่ตรงนี้ จะได้ค่า beatAvg และ sp02Avg)
+    // ... โค้ดคำนวณของคุณ ...
+
+    // วิเคราะห์อาการ (หลังจากสอดนิ้วไปแล้ว 2 วินาที เพื่อให้ค่าเซ็นเซอร์นิ่งก่อน)
+    if (millis() - fingerStartTime < 2000) {
+      currentAiState = 1; // สถานะ Calibrate
+    } else {
+      if (beatAvg > 100) {
+        currentAiState = 2; // หัวใจเต้นเร็ว
+      } else if (beatAvg > 0 && beatAvg < 60) {
+        currentAiState = 3; // หัวใจเต้นช้า
+      } else if (sp02Avg > 0 && sp02Avg < 95) {
+        currentAiState = 4; // ออกซิเจนต่ำ
+      } else if (beatAvg >= 60 && beatAvg <= 100) {
+        currentAiState = 5; // ปกติ
+      }
+    }
+  }
+
+  // ---------------------------------------------------------
+  // ส่วนที่ 2: อัปเดตข้อมูลขึ้นแอป Blynk (ทุกๆ 1 วินาที เพื่อไม่ให้เน็ตค้าง)
+  // ---------------------------------------------------------
+  if (millis() - blynkPrevMillis > 1000) {
+    blynkPrevMillis = millis();
+
+    // 1. อัปเดตตัวเลขและไฟ LED (V0, V1, V2)
+    Blynk.virtualWrite(V0, fingerInserted ? 255 : 0);
+    Blynk.virtualWrite(V1, beatAvg);
+    Blynk.virtualWrite(V2, sp02Avg);
+
+    // 2. แจ้งเตือน Doctor AI (V6) - ส่งเฉพาะตอนที่อาการเปลี่ยนแปลง
+    if (currentAiState != lastAiState) {
+      lastAiState = currentAiState; // จำสถานะล่าสุดไว้
+
+      switch (currentAiState) {
+        case 0: Blynk.virtualWrite(V6, "Doctor AI: กรุณาสวมถุงมือให้กระชับครับ\n"); break;
+        case 1: Blynk.virtualWrite(V6, "Doctor AI: กำลัง Calibrate เซ็นเซอร์... กรุณานิ่งๆ ครับ\n"); break;
+        case 2: Blynk.virtualWrite(V6, "Warning: ชีพจรเต้นเร็วผิดปกติ!\n"); break;
+        case 3: Blynk.virtualWrite(V6, "Warning: ชีพจรเต้นช้าต่ำกว่าปกติ!\n"); break;
+        case 4: Blynk.virtualWrite(V6, "Warning: ตรวจพบออกซิเจนต่ำ!\n"); break;
+        case 5: Blynk.virtualWrite(V6, "Doctor AI: สัญญาณชีพและออกซิเจนปกติดีครับ (60-100 BPM)\n"); break;
+      }
+    }
+  }
+
+  // ---------------------------------------------------------
+  // ส่วนที่ 3: ส่งข้อมูลขึ้น Firebase (ทุกๆ 5 วินาทีเหมือนเดิม)
+  // ---------------------------------------------------------
+  if (Firebase.ready() && signupOK && (millis() - sendDataPrevMillis > 5000 || sendDataPrevMillis == 0)) {
+    sendDataPrevMillis = millis();
+    
+    // ส่งข้อมูลไป Firebase เฉพาะตอนที่มีการวัดผลจริงๆ
+    FirebaseJson json;
+    json.set("BPM", beatAvg);
+    json.set("SpO2", sp02Avg);
+    json.set("Status", currentAiState);
+    if (Firebase.RTDB.setJSON(&fbdo, "/SleepData", &json)) {
+      Serial.println("(ส่งข้อมูลสำเร็จ!)");
+    }
+  }
+}
