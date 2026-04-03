@@ -47,6 +47,14 @@ void checkHealthAI() {
     beatAvg = 0;                // ล้างค่า
     sp02Avg = 0;                // ล้างค่า
     bufferIndex = 0;            // ล้างข้อมูลที่สะสมไว้ทิ้งไป
+    rateSpot = 0;
+    spo2RateSpot = 0;
+    for (byte i = 0; i < 4; i++) {
+      rates[i] = 0;
+    }
+    for (byte i = 0; i < SPO2_RATE_SIZE; i++) {
+      spo2Rates[i] = 0;
+    }
     
     terminal.println("Doctor AI: กรุณาสวมถุงมือให้กระชับครับ");
     Blynk.virtualWrite(V1, 0);  
