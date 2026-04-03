@@ -1,0 +1,203 @@
+// ==========================================
+// 1. ใส่ข้อมูล Blynk
+// ==========================================
+#define BLYNK_TEMPLATE_ID "TMPLxxxxxx"
+#define BLYNK_TEMPLATE_NAME "Sleep Apnea"
+#define BLYNK_AUTH_TOKEN "ใส่_Blynk_Token_ที่นี่"
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <Firebase_ESP_Client.h>
+#include <BlynkSimpleEsp32.h>
+#include <Wire.h>
+#include "MAX30105.h"
+#include "heartRate.h"
+
+// ==========================================
+// 2. ข้อมูล WiFi และ Firebase
+// ==========================================
+#define WIFI_SSID "HONOR Pad X8a"
+#define WIFI_PASSWORD "Alamoo88"
+#define API_KEY "AIzaSyCM9AQqbKxfoRh0mNAfOqFnj2zex-fxIGI"
+#define DATABASE_URL "sleep-e3056-default-rtdb.asia-southeast1.firebasedatabase.app" 
+
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+bool signupOK = false;
+MAX30105 particleSensor;
+
+// ==========================================
+// 3.  ตัวแปรส่วนกลาง (ต้องมี volatile เพื่อแชร์ข้าม Core)
+// ==========================================
+volatile int shared_beatAvg = 0;
+volatile int shared_sp02Avg = 0;
+volatile bool shared_fingerInserted = false;
+volatile int shared_currentAiState = 0;
+
+// ==========================================
+// 4.  สร้างชื่อ Task สำหรับ 2 สมอง
+// ==========================================
+TaskHandle_t TaskNetwork;
+TaskHandle_t TaskSensor;
+
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  // 1. เปิดเซ็นเซอร์ก่อน (ถ้าพัง จะได้รู้เลย)
+  if (!particleSensor.begin(Wire, I2C_SPEED_FAST)) {
+    Serial.println("MAX30102 ไม่ตอบสนอง! ค้างการทำงาน...");
+    while (1); 
+  }
+  particleSensor.setup(); 
+  particleSensor.setPulseAmplitudeRed(0x0A); 
+  particleSensor.setPulseAmplitudeGreen(0); 
+
+  // 2. เชื่อมต่อ WiFi
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("Connecting to Wi-Fi");
+  while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
+  Serial.println("\n[SUCCESS] WiFi Connected!");
+
+  // 3. เชื่อมต่อ Firebase และ Blynk
+  configTime(7 * 3600, 0, "pool.ntp.org", "time.nist.gov"); 
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+  if (Firebase.signUp(&config, &auth, "", "")) { signupOK = true; }
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+  Blynk.config(BLYNK_AUTH_TOKEN);
+
+  Blynk.virtualWrite(V6, "กำลังคำนวณ...\n");
+
+  // ==========================================
+  //  4. แยกร่างสมอง Dual Core (FreeRTOS)
+  // ==========================================
+  // มอบหมายให้ Core 0 ทำงาน Network
+  xTaskCreatePinnedToCore(
+    NetworkTaskCode,   // ชื่อฟังก์ชัน
+    "TaskNetwork",     // ชื่อ Task (ไว้เช็ก Error)
+    10000,             // ขนาด RAM (Stack Size)
+    NULL, 
+    1,                 // ความสำคัญ (Priority 1)
+    &TaskNetwork, 
+    0                  //  ระบุว่าใช้ Core 0 (เน็ต)
+  ); 
+
+  // มอบหมายให้ Core 1 ทำงาน Sensor
+  xTaskCreatePinnedToCore(
+    SensorTaskCode, 
+    "TaskSensor", 
+    10000, 
+    NULL, 
+    1,                 // ความสำคัญ (Priority 1)
+    &TaskSensor, 
+    1                  // ระบุว่าใช้ Core 1 (เซ็นเซอร์)
+  ); 
+}
+
+void loop() {
+  // ปล่อยว่างไปเลยครับ! เพราะเราแยกงานไปให้ Task หมดแล้ว
+  vTaskDelete(NULL); 
+}
+
+// ==========================================
+//  สมองซีกขวา: Core 1 (อ่านเซ็นเซอร์อย่างเดียว)
+// ==========================================
+void SensorTaskCode(void * pvParameters) {
+  unsigned long fingerStartTime = 0;
+
+  for(;;) { // Loop ตลอดกาลของ Core 1
+    long irValue = particleSensor.getIR();
+
+    if (irValue < 50000) {
+      shared_fingerInserted = false;
+      shared_beatAvg = 0;
+      shared_sp02Avg = 0;
+      shared_currentAiState = 0; 
+    } else {
+      if (!shared_fingerInserted) {
+        shared_fingerInserted = true;
+        fingerStartTime = millis();
+      }
+
+      // ------------------------------------
+      // ... โค้ดคำนวณ BPM และ SpO2 ของคุณ ...
+      // สมมติว่าได้ค่ามาแล้ว ให้เอามาอัปเดตตัวแปรส่วนกลาง
+      // shared_beatAvg = ...;
+      // shared_sp02Avg = ...;
+      // ------------------------------------
+
+      if (millis() - fingerStartTime < 2000) {
+        shared_currentAiState = 1;
+      } else {
+        if (shared_beatAvg > 100) shared_currentAiState = 2;
+        else if (shared_beatAvg > 0 && shared_beatAvg < 60) shared_currentAiState = 3;
+        else if (shared_sp02Avg > 0 && shared_sp02Avg < 95) shared_currentAiState = 4;
+        else if (shared_beatAvg >= 60 && shared_beatAvg <= 100) shared_currentAiState = 5;
+      }
+    }
+
+    // ห้ามเอาออกเด็ดขาด: ให้ Core 1 พักหายใจ 10 มิลลิวินาที ป้องกันบอร์ดรีสตาร์ทตัวเอง
+    vTaskDelay(10 / portTICK_PERIOD_MS); 
+  }
+}
+
+// ==========================================
+//  สมองซีกซ้าย: Core 0 (ส่งเน็ต Firebase + Blynk)
+// ==========================================
+void NetworkTaskCode(void * pvParameters) {
+  unsigned long blynkPrevMillis = 0;
+  unsigned long sendDataPrevMillis = 0;
+  int lastAiState = -1;
+
+  for(;;) { // Loop ตลอดกาลของ Core 0
+    Blynk.run(); // ดูแล Blynk
+
+    // --- ส่วนของ Blynk (ทุกๆ 1 วินาที) ---
+    if (millis() - blynkPrevMillis > 1000) {
+      blynkPrevMillis = millis();
+
+      // ดึงข้อมูลจากตัวแปรส่วนกลางมาส่ง Blynk
+      Blynk.virtualWrite(V0, shared_fingerInserted ? 255 : 0);
+      Blynk.virtualWrite(V1, shared_beatAvg);
+      Blynk.virtualWrite(V2, shared_sp02Avg);
+
+      if (shared_currentAiState != lastAiState) {
+        lastAiState = shared_currentAiState;
+        switch (shared_currentAiState) {
+          case 0: Blynk.virtualWrite(V6, "Doctor AI: กรุณาสวมถุงมือให้กระชับครับ\n"); break;
+          case 1: Blynk.virtualWrite(V6, "Doctor AI: กำลัง Calibrate เซ็นเซอร์... นิ่งๆ ครับ\n"); break;
+          case 2: Blynk.virtualWrite(V6, "Warning: ชีพจรเต้นเร็วผิดปกติ!\n"); break;
+          case 3: Blynk.virtualWrite(V6, "Warning: ชีพจรเต้นช้าต่ำกว่าปกติ!\n"); break;
+          case 4: Blynk.virtualWrite(V6, "Warning: ตรวจพบออกซิเจนต่ำ!\n"); break;
+          case 5: Blynk.virtualWrite(V6, "Doctor AI: สัญญาณชีพและออกซิเจนปกติดีครับ\n"); break;
+        }
+      }
+    }
+
+    // --- ส่วนของ Firebase (ส่งแบบ JSON ทุกๆ 5 วินาที) ---
+    if (Firebase.ready() && signupOK && (millis() - sendDataPrevMillis > 5000)) {
+      sendDataPrevMillis = millis();
+      
+      if (shared_fingerInserted) {
+        //  สร้างกล่อง JSON ยัดข้อมูลส่งรวดเดียว (เร็วปรื๊ด)
+        FirebaseJson json;
+        json.set("BPM", shared_beatAvg);
+        json.set("SpO2", shared_sp02Avg);
+        json.set("AI_Status", shared_currentAiState);
+
+        if (Firebase.RTDB.setJSON(&fbdo, "/SleepData", &json)) {
+          Serial.println("[Firebase] ส่งข้อมูล JSON สำเร็จ!");
+        } else {
+          Serial.println("[Firebase] ขัดข้อง: " + fbdo.errorReason());
+        }
+      }
+    }
+
+    // ให้ Core 0 พักหายใจ 10 มิลลิวินาที
+    vTaskDelay(10 / portTICK_PERIOD_MS); 
+  }
+}
